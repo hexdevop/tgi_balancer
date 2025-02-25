@@ -14,6 +14,9 @@ from pydantic import BaseModel, Field
 import random
 import json
 
+from prometheus_client import Counter, Histogram, Gauge, Summary
+from prometheus_fastapi_instrumentator import Instrumentator
+
 # Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
@@ -43,6 +46,12 @@ class ServerStats(BaseModel):
 
 # Инициализация FastAPI
 app = FastAPI(title="TGI Load Balancer")
+
+# Инициализация Prometheus
+Instrumentator().instrument(app).expose(app)
+
+# Запрос на генерацию текста
+TEXT_LLM_REQUEST_LATENCY = Summary('text_llm_request_latency_seconds', 'Time spent processing request')
 
 # Настройка CORS
 app.add_middleware(
@@ -140,89 +149,90 @@ async def get_stats():
 # Основной эндпоинт для генерации текста
 @app.post("/generate")
 async def generate(request: GenerationRequest, background_tasks: BackgroundTasks):
-    request_id = str(uuid.uuid4())
-    start_time = time.time()
+    with TEXT_LLM_REQUEST_LATENCY.time():
+        request_id = str(uuid.uuid4())
+        start_time = time.time()
 
-    logger.info(
-        f"Получен запрос {request_id}: длина входного текста {len(request.inputs)} символов, stream={request.stream}"
-    )
-
-    # Выбор сервера
-    server_url = await select_server()
-    tgi_endpoint = f"{server_url}/generate"
-
-    # Обновление статистики запроса
-    await update_stats_request(server_url)
-
-    try:
-        if request.stream:
-            return await handle_streaming_request(
-                request, server_url, request_id, start_time
-            )
-        else:
-            return await handle_normal_request(
-                request, server_url, request_id, start_time
-            )
-    except Exception as e:
-        elapsed = time.time() - start_time
-        logger.error(
-            f"Ошибка в запросе {request_id} к {server_url}: {str(e)}, время: {elapsed:.4f}с"
+        logger.info(
+            f"Получен запрос {request_id}: длина входного текста {len(request.inputs)} символов, stream={request.stream}"
         )
 
-        # Обновление статистики при ошибке
-        background_tasks.add_task(update_stats_response, server_url, elapsed, False)
+        # Выбор сервера
+        server_url = await select_server()
+        tgi_endpoint = f"{server_url}/generate"
 
-        # Попробуем другой сервер, если доступен
-        if len(TGI_SERVERS) > 1:
-            fallback_servers = [s for s in TGI_SERVERS if s != server_url]
-            fallback_server = random.choice(fallback_servers)
+        # Обновление статистики запроса
+        await update_stats_request(server_url)
 
-            logger.info(
-                f"Повторная попытка запроса {request_id} на резервном сервере {fallback_server}"
+        try:
+            if request.stream:
+                return await handle_streaming_request(
+                    request, server_url, request_id, start_time
+                )
+            else:
+                return await handle_normal_request(
+                    request, server_url, request_id, start_time
+                )
+        except Exception as e:
+            elapsed = time.time() - start_time
+            logger.error(
+                f"Ошибка в запросе {request_id} к {server_url}: {str(e)}, время: {elapsed:.4f}с"
             )
 
-            try:
-                await update_stats_request(fallback_server)
-                fallback_endpoint = f"{fallback_server}/generate"
+            # Обновление статистики при ошибке
+            background_tasks.add_task(update_stats_response, server_url, elapsed, False)
 
-                if request.stream:
-                    return await stream_from_tgi(
-                        fallback_endpoint,
-                        request,
-                        request_id,
-                        fallback_server,
-                        start_time,
-                        background_tasks,
-                    )
-                else:
-                    response = await http_client.post(
-                        fallback_endpoint, json=request.model_dump()
-                    )
+            # Попробуем другой сервер, если доступен
+            if len(TGI_SERVERS) > 1:
+                fallback_servers = [s for s in TGI_SERVERS if s != server_url]
+                fallback_server = random.choice(fallback_servers)
 
+                logger.info(
+                    f"Повторная попытка запроса {request_id} на резервном сервере {fallback_server}"
+                )
+
+                try:
+                    await update_stats_request(fallback_server)
+                    fallback_endpoint = f"{fallback_server}/generate"
+
+                    if request.stream:
+                        return await stream_from_tgi(
+                            fallback_endpoint,
+                            request,
+                            request_id,
+                            fallback_server,
+                            start_time,
+                            background_tasks,
+                        )
+                    else:
+                        response = await http_client.post(
+                            fallback_endpoint, json=request.model_dump()
+                        )
+
+                        new_elapsed = time.time() - start_time
+                        logger.info(
+                            f"Запрос {request_id} к резервному серверу {fallback_server} выполнен за {new_elapsed:.4f}с"
+                        )
+                        background_tasks.add_task(
+                            update_stats_response, fallback_server, new_elapsed, True
+                        )
+
+                        return JSONResponse(content=response.json())
+                except Exception as fallback_error:
                     new_elapsed = time.time() - start_time
-                    logger.info(
-                        f"Запрос {request_id} к резервному серверу {fallback_server} выполнен за {new_elapsed:.4f}с"
+                    logger.error(
+                        f"Ошибка в резервном запросе {request_id} к {fallback_server}: {str(fallback_error)}, время: {new_elapsed:.4f}с"
                     )
                     background_tasks.add_task(
-                        update_stats_response, fallback_server, new_elapsed, True
+                        update_stats_response, fallback_server, new_elapsed, False
                     )
 
-                    return JSONResponse(content=response.json())
-            except Exception as fallback_error:
-                new_elapsed = time.time() - start_time
-                logger.error(
-                    f"Ошибка в резервном запросе {request_id} к {fallback_server}: {str(fallback_error)}, время: {new_elapsed:.4f}с"
-                )
-                background_tasks.add_task(
-                    update_stats_response, fallback_server, new_elapsed, False
-                )
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"All TGI servers failed: {str(e)}, Fallback error: {str(fallback_error)}",
+                    )
 
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"All TGI servers failed: {str(e)}, Fallback error: {str(fallback_error)}",
-                )
-
-        raise HTTPException(status_code=500, detail=str(e))
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 # Обработка обычного (не потокового) запроса
