@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 import random
 import json
 
-from prometheus_client import Counter, Histogram, Gauge, Summary
+from prometheus_client import Summary
 from prometheus_fastapi_instrumentator import Instrumentator
 
 # Настройка логирования
@@ -50,8 +50,7 @@ app = FastAPI(title="TGI Load Balancer")
 # Инициализация Prometheus
 Instrumentator().instrument(app).expose(app)
 
-# Запрос на генерацию текста
-TEXT_LLM_REQUEST_LATENCY = Summary('text_llm_request_latency_seconds', 'Time spent processing request')
+TEXT_LLM_REQUEST_LATENCY = Summary('tgi_request_latency_seconds', 'Time spent processing request')
 
 # Настройка CORS
 app.add_middleware(
@@ -354,4 +353,4 @@ async def check_servers():
 
 # Запуск сервера
 if __name__ == "__main__":
-    uvicorn.run("tgi_balancer:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=1100)

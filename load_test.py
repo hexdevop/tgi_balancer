@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 from prompts import SAMPLE_PROMPTS
 
 # Конфигурация теста
-BALANCER_URL = "http://localhost:1105/generate"
+BALANCER_URL = "http://localhost:1100/generate"
 NUM_REQUESTS = 25  # Общее количество запросов
 CONCURRENT_REQUESTS = 3  # Максимальное число одновременных запросов
 TEST_DURATION_SECONDS = 300  # Продолжительность теста
